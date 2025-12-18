@@ -55,6 +55,7 @@ def search(
     match: str = Query("word", pattern="^(word|phrase)$"),
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=200),
+    include_text: bool = Query(True),
     x_api_key: Optional[str] = Header(None)
 ):
     require_api_key(x_api_key)
@@ -98,16 +99,26 @@ def search(
                     break
 
         if ok:
-            sura_no = r.get("sura_no")
-            aya_no = r.get("aya_no")
-            verse_key = f"{sura_no}:{aya_no}"
-            results.append({
-                "verse_key": verse_key,
-                "sura_no": sura_no,
-                "aya_no": aya_no,
-                "id": r.get("id"),
-                "matched_term": matched_term
-            })
+    sura_no = r.get("sura_no")
+    aya_no = r.get("aya_no")
+
+    item = {
+        "verse_key": f"{sura_no}:{aya_no}",
+        "sura_no": sura_no,
+        "aya_no": aya_no,
+        "id": r.get("id"),
+        "matched_term": matched_term
+    }
+
+    # If include_text=true, return the full display data in the same search call
+    if include_text:
+        item["aya_text"] = r.get("aya_text")
+        item["sura_name_ar"] = r.get("sura_name_ar")
+        item["jozz"] = r.get("jozz")
+        item["page"] = r.get("page")
+
+    results.append(item)
+
 
     total = len(results)
     page = results[offset: offset + limit]
