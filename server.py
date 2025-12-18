@@ -158,13 +158,14 @@ def get_verse(
     except:
         raise HTTPException(status_code=400, detail="Invalid verse_key numbers")
 
-        for r in records:
+    for r in records:
         if r.get("sura_no") == s_no and r.get("aya_no") == a_no:
             out = dict(r)
             out["verse_key"] = f"{s_no}:{a_no}"
             return out
 
     raise HTTPException(status_code=404, detail="Not found")
+
 
 
 @app.get("/v1/topic")
