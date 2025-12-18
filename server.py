@@ -105,26 +105,26 @@ def search(
                     matched_term = term
                     break
 
-        if ok:
-    sura_no = r.get("sura_no")
-    aya_no = r.get("aya_no")
+               if ok:
+            sura_no = r.get("sura_no")
+            aya_no = r.get("aya_no")
 
-    item = {
-        "verse_key": f"{sura_no}:{aya_no}",
-        "sura_no": sura_no,
-        "aya_no": aya_no,
-        "id": r.get("id"),
-        "matched_term": matched_term
-    }
+            item = {
+                "verse_key": f"{sura_no}:{aya_no}",
+                "sura_no": sura_no,
+                "aya_no": aya_no,
+                "id": r.get("id"),
+                "matched_term": matched_term
+            }
 
-    # If include_text=true, return the full display data in the same search call
-    if include_text:
-        item["aya_text"] = r.get("aya_text")
-        item["sura_name_ar"] = r.get("sura_name_ar")
-        item["jozz"] = r.get("jozz")
-        item["page"] = r.get("page")
+            if include_text:
+                item["aya_text"] = r.get("aya_text")
+                item["sura_name_ar"] = r.get("sura_name_ar")
+                item["jozz"] = r.get("jozz")
+                item["page"] = r.get("page")
 
-    results.append(item)
+            results.append(item)
+
 
 
     total = len(results)
@@ -158,12 +158,14 @@ def get_verse(
     except:
         raise HTTPException(status_code=400, detail="Invalid verse_key numbers")
 
-    for r in records:
+        for r in records:
         if r.get("sura_no") == s_no and r.get("aya_no") == a_no:
             out = dict(r)
             out["verse_key"] = f"{s_no}:{a_no}"
-            # IMPORTANT: aya_text is the only Quran text to display (exact as stored)
             return out
+
+    raise HTTPException(status_code=404, detail="Not found")
+
 
 @app.get("/v1/topic")
 def get_topic(
@@ -215,4 +217,4 @@ def get_topic(
         "results": results
     }
 
-    raise HTTPException(status_code=404, detail="Not found")
+
