@@ -44,7 +44,8 @@ records: List[Dict[str, Any]] = raw if isinstance(raw, list) else raw.get("data"
 if not isinstance(records, list):
     raise RuntimeError("Unexpected JSON structure: expected a list of ayah records.")
 
-TOPICS_PATH = os.environ.get("TOPICS_PATH", "topics_basic.json")
+TOPICS_PATH = os.environ.get("TOPICS_PATH", "topics_core.json")
+
 topics = {}
 if os.path.exists(TOPICS_PATH):
     with open(TOPICS_PATH, "r", encoding="utf-8") as tf:
