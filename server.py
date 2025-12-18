@@ -71,17 +71,16 @@ def search(
     if not qn:
         raise HTTPException(status_code=400, detail="Empty query")
 
-    # Build meaning terms if requested
     terms: List[str] = []
     if mode == "meaning":
         tokens = [t for t in qn.split(" ") if t]
-        # If user query touches Allah/Rab group, expand it
         if any(t in ALLAH_SEED_TERMS for t in tokens):
             terms = ALLAH_MEANING_TERMS
         else:
-            terms = tokens  # meaning mode but no known group: use tokens as OR list
+            terms = tokens
 
-    results = []
+    results: List[Dict[str, Any]] = []
+
     for r in records:
         t = r.get("aya_text_emlaey") or ""
         if not t:
@@ -93,23 +92,24 @@ def search(
         if mode == "literal":
             if match == "phrase":
                 ok = qn in t
-                matched_term = qn if ok else None
-            else:  # word
+                if ok:
+                    matched_term = qn
+            else:
                 ok = match_word(t, qn)
-                matched_term = qn if ok else None
-        else:  # meaning
-            # Meaning = OR over terms, word-level matching
+                if ok:
+                    matched_term = qn
+        else:
             for term in terms:
                 if match_word(t, term):
                     ok = True
                     matched_term = term
                     break
 
-               if ok:
+        if ok:
             sura_no = r.get("sura_no")
             aya_no = r.get("aya_no")
 
-            item = {
+            item: Dict[str, Any] = {
                 "verse_key": f"{sura_no}:{aya_no}",
                 "sura_no": sura_no,
                 "aya_no": aya_no,
@@ -125,8 +125,6 @@ def search(
 
             results.append(item)
 
-
-
     total = len(results)
     page = results[offset: offset + limit]
 
@@ -139,6 +137,8 @@ def search(
         "limit": limit,
         "results": page
     }
+
+
 
 @app.get("/v1/verse/{verse_key}")
 def get_verse(
