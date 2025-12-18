@@ -51,6 +51,16 @@ if os.path.exists(TOPICS_PATH):
     with open(TOPICS_PATH, "r", encoding="utf-8") as tf:
         topics = json.load(tf)
 
+# Build an index: Arabic label -> topic_id
+topics_by_label = {}
+if isinstance(topics, dict):
+    for tid, obj in topics.items():
+        if isinstance(obj, dict):
+            lab = norm_q(obj.get("label_ar", ""))
+            if lab:
+                topics_by_label[lab] = tid
+
+
 
 @app.get("/v1/health")
 def health():
@@ -179,11 +189,18 @@ def get_topic(
 ):
     require_api_key(x_api_key)
 
-    n = norm_q(name)
-    if n not in topics:
-        return {"topic": n, "found": False, "total": 0, "offset": offset, "limit": limit, "results": []}
+n = norm_q(name)
 
-    verse_keys = topics[n].get("verse_keys", []) or []
+# Accept either topic_id (e.g., "ghiba") OR Arabic label (e.g., "الغيبة")
+tid = n if n in topics else topics_by_label.get(n)
+
+if not tid:
+    return {"topic": n, "found": False, "total": 0, "offset": offset, "limit": limit, "results": []}
+
+topic_obj = topics.get(tid, {}) if isinstance(topics, dict) else {}
+verse_keys = topic_obj.get("verse_keys", []) or []
+
+
     total = len(verse_keys)
     page_keys = verse_keys[offset: offset + limit]
 
@@ -212,7 +229,7 @@ def get_topic(
     return {
         "topic": n,
         "found": True,
-        "description": topics[n].get("description"),
+        "description": topic_obj.get("description"),
         "total": total,
         "offset": offset,
         "limit": limit,
