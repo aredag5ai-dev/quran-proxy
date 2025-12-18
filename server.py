@@ -44,6 +44,13 @@ records: List[Dict[str, Any]] = raw if isinstance(raw, list) else raw.get("data"
 if not isinstance(records, list):
     raise RuntimeError("Unexpected JSON structure: expected a list of ayah records.")
 
+TOPICS_PATH = os.environ.get("TOPICS_PATH", "topics_basic.json")
+topics = {}
+if os.path.exists(TOPICS_PATH):
+    with open(TOPICS_PATH, "r", encoding="utf-8") as tf:
+        topics = json.load(tf)
+
+
 @app.get("/v1/health")
 def health():
     return {"ok": True, "records": len(records)}
@@ -157,5 +164,55 @@ def get_verse(
             out["verse_key"] = f"{s_no}:{a_no}"
             # IMPORTANT: aya_text is the only Quran text to display (exact as stored)
             return out
+
+@app.get("/v1/topic")
+def get_topic(
+    name: str = Query(..., min_length=1),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(25, ge=1, le=200),
+    include_text: bool = Query(True),
+    x_api_key: Optional[str] = Header(None)
+):
+    require_api_key(x_api_key)
+
+    n = norm_q(name)
+    if n not in topics:
+        return {"topic": n, "found": False, "total": 0, "offset": offset, "limit": limit, "results": []}
+
+    verse_keys = topics[n].get("verse_keys", []) or []
+    total = len(verse_keys)
+    page_keys = verse_keys[offset: offset + limit]
+
+    results = []
+    for vk in page_keys:
+        # reuse existing verse lookup logic
+        # vk is like "49:12"
+        s, a = vk.split(":", 1)
+        s_no = int(s); a_no = int(a)
+        rec = None
+        for r in records:
+            if r.get("sura_no") == s_no and r.get("aya_no") == a_no:
+                rec = r
+                break
+        if not rec:
+            continue
+
+        item = {"verse_key": vk, "sura_no": s_no, "aya_no": a_no}
+        if include_text:
+            item["aya_text"] = rec.get("aya_text")
+            item["sura_name_ar"] = rec.get("sura_name_ar")
+            item["jozz"] = rec.get("jozz")
+            item["page"] = rec.get("page")
+        results.append(item)
+
+    return {
+        "topic": n,
+        "found": True,
+        "description": topics[n].get("description"),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": results
+    }
 
     raise HTTPException(status_code=404, detail="Not found")
