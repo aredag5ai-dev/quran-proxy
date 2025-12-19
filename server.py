@@ -18,13 +18,47 @@ API_KEY = os.environ.get("PROXY_API_KEY", "")
 QURAN_API_BASE = os.environ.get("QURAN_API_BASE", "https://api.quran.com/api/v4")
 QURAN_VERSE_AUDIO_BASE = os.environ.get("QURAN_VERSE_AUDIO_BASE", "https://verses.quran.foundation/")
 
-# Arabic/Indic digits -> western
 AR_NUM = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 def norm_q(s: str) -> str:
     s = (s or "").strip().translate(AR_NUM)
     s = re.sub(r"\s+", " ", s)
     return s
+
+def extract_topic_name(s: str) -> str:
+    """
+    Robust extraction so API accepts:
+    - "آيات عن الصبر" -> "الصبر"
+    - "ايات عن الصبر" -> "الصبر"
+    - "آية عن الصبر" -> "الصبر"
+    - "عن الصبر" -> "الصبر"
+    - "موضوع الصبر" -> "الصبر"
+    - "بالمعنى الصبر" -> "الصبر"
+    """
+    x = norm_q(s)
+
+    # Remove common leading phrases (Arabic)
+    # We keep it conservative: ONLY remove wrappers, not changing meaning.
+    patterns = [
+        r'^(?:آيات|ايات|آية|اية)\s+عن\s+',
+        r'^عن\s+',
+        r'^(?:موضوع|الموضوع)\s+',
+        r'^(?:بالمعنى|بمعنى)\s+',
+        r'^(?:ابحث|دور|عايز|أريد|اريد)\s+(?:عن\s+)?',
+        r'^(?:آيات|ايات)\s+(?:تتحدث\s+)?عن\s+'
+    ]
+    for p in patterns:
+        x2 = re.sub(p, "", x)
+        if x2 != x:
+            x = x2.strip()
+
+    # Remove trailing punctuation
+    x = re.sub(r'[؟\?\!\.\,\؛\:\-]+$', "", x).strip()
+
+    # If user wrote "آيات عن الصبر في القرآن" -> remove ending wrappers
+    x = re.sub(r'\s+(?:في\s+القرآن|بالقرآن|من\s+القرآن)$', "", x).strip()
+
+    return x
 
 def require_api_key(x_api_key: Optional[str]):
     if not API_KEY:
@@ -33,7 +67,6 @@ def require_api_key(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def match_word(text: str, token: str) -> bool:
-    # full-word-ish match for Arabic emlaey
     pat = r'(^|[^\w])' + re.escape(token) + r'([^\w]|$)'
     return re.search(pat, text, flags=re.UNICODE) is not None
 
@@ -56,7 +89,6 @@ records: List[Dict[str, Any]] = raw if isinstance(raw, list) else raw.get("data"
 if not isinstance(records, list):
     raise RuntimeError("Unexpected JSON structure: expected a list of ayah records.")
 
-# Build fast lookup by verse_key
 by_key: Dict[str, Dict[str, Any]] = {}
 for r in records:
     s = r.get("sura_no")
@@ -71,7 +103,6 @@ topics = load_json_if_exists(TOPICS_PATH, {})
 lexicon = load_json_if_exists(LEXICON_PATH, {})
 stopwords_list = load_json_if_exists(STOPWORDS_PATH, [])
 
-# normalize stopwords to a set
 stopwords = set()
 if isinstance(stopwords_list, list):
     for w in stopwords_list:
@@ -125,9 +156,8 @@ def search(
     if not qn:
         raise HTTPException(status_code=400, detail="Empty query")
 
-    # Stopword behavior: return count only
+    # Stopword: count-only
     if qn in stopwords:
-        # count total quickly
         total = 0
         for r in records:
             t = r.get("aya_text_emlaey") or ""
@@ -153,11 +183,7 @@ def search(
         if not t:
             continue
 
-        if match == "phrase":
-            ok = qn in t
-        else:
-            ok = match_word(t, qn)
-
+        ok = (qn in t) if match == "phrase" else match_word(t, qn)
         if ok:
             s = r.get("sura_no")
             a = r.get("aya_no")
@@ -177,7 +203,6 @@ def search(
 
     total = len(results)
     page = results[offset: offset + limit]
-
     return {
         "query": qn,
         "mode": "literal",
@@ -189,7 +214,7 @@ def search(
     }
 
 # =====================
-# Topic (manual curated)
+# Topic (curated)
 # =====================
 @app.get("/v1/topic")
 def get_topic(
@@ -200,7 +225,8 @@ def get_topic(
     x_api_key: Optional[str] = Header(None)
 ):
     require_api_key(x_api_key)
-    n = norm_q(name)
+    n_raw = norm_q(name)
+    n = extract_topic_name(n_raw)
 
     if not isinstance(topics, dict) or n not in topics:
         return {"topic": n, "found": False, "total": 0, "offset": offset, "limit": limit, "results": []}
@@ -250,111 +276,139 @@ def meaning(
     x_api_key: Optional[str] = Header(None)
 ):
     require_api_key(x_api_key)
-    n = norm_q(name)
 
-    # 1) lexicon mode: tokens -> OR word matches
-    if prefer == "lexicon" and isinstance(lexicon, dict) and n in lexicon:
-        entry = lexicon[n] or {}
-        tokens = entry.get("tokens", []) or []
-        tokens = [norm_q(t) for t in tokens if isinstance(t, str) and t.strip()]
+    n_raw = norm_q(name)
+    n = extract_topic_name(n_raw)
 
-        # if tokens are too common, count_only
-        if any(t in stopwords for t in tokens):
+    # Try exact, then remove leading "ال" once
+    candidates = [n]
+    if n.startswith("ال") and len(n) > 2:
+        candidates.append(n[2:])
+    # also try adding "ال" if user wrote without it
+    if not n.startswith("ال"):
+        candidates.append("ال" + n)
+
+    # 1) lexicon preferred
+    if prefer == "lexicon" and isinstance(lexicon, dict):
+        entry = None
+        used_key = None
+        for c in candidates:
+            if c in lexicon:
+                entry = lexicon[c]
+                used_key = c
+                break
+
+        if entry is not None:
+            entry = entry or {}
+            tokens = entry.get("tokens", []) or []
+            tokens = [norm_q(t) for t in tokens if isinstance(t, str) and t.strip()]
+
+            # if tokens too common -> count_only guard
+            if any(t in stopwords for t in tokens):
+                return {
+                    "query": used_key or n,
+                    "mode": "lexicon",
+                    "found": True,
+                    "lexicon_id": entry.get("lexicon_id"),
+                    "label_ar": entry.get("label_ar", used_key or n),
+                    "category": entry.get("category"),
+                    "tokens_used": tokens,
+                    "count_only": True,
+                    "total": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "results": []
+                }
+
+            hits = []
+            for r in records:
+                t = r.get("aya_text_emlaey") or ""
+                if not t:
+                    continue
+                ok = False
+                for tok in tokens:
+                    if tok and match_word(t, tok):
+                        ok = True
+                        break
+                if ok:
+                    s = r.get("sura_no")
+                    a = r.get("aya_no")
+                    hits.append({"verse_key": f"{s}:{a}", "sura_no": s, "aya_no": a})
+
+            total = len(hits)
+            page = hits[offset: offset + limit]
+
+            if include_text:
+                hydrated = []
+                for item in page:
+                    vk = item["verse_key"]
+                    rec = by_key.get(vk)
+                    if not rec:
+                        continue
+                    obj = dict(item)
+                    obj["aya_text"] = rec.get("aya_text")
+                    obj["sura_name_ar"] = rec.get("sura_name_ar")
+                    obj["jozz"] = rec.get("jozz")
+                    obj["page"] = rec.get("page")
+                    hydrated.append(obj)
+                page = hydrated
+
             return {
-                "query": n,
+                "query": used_key or n,
                 "mode": "lexicon",
                 "found": True,
                 "lexicon_id": entry.get("lexicon_id"),
-                "label_ar": entry.get("label_ar", n),
+                "label_ar": entry.get("label_ar", used_key or n),
                 "category": entry.get("category"),
                 "tokens_used": tokens,
-                "count_only": True,
-                "total": 0,
+                "total": total,
                 "offset": offset,
                 "limit": limit,
-                "results": []
+                "results": page
             }
 
-        results_keys = []
-        for r in records:
-            t = r.get("aya_text_emlaey") or ""
-            if not t:
-                continue
-            ok = False
-            for tok in tokens:
-                if tok and match_word(t, tok):
-                    ok = True
-                    break
-            if ok:
-                s = r.get("sura_no"); a = r.get("aya_no")
-                results_keys.append({"verse_key": f"{s}:{a}", "sura_no": s, "aya_no": a})
+    # 2) topic fallback
+    if isinstance(topics, dict):
+        obj = None
+        used_key = None
+        for c in candidates:
+            if c in topics:
+                obj = topics[c]
+                used_key = c
+                break
 
-        total = len(results_keys)
-        page = results_keys[offset: offset + limit]
-
-        # hydrate with text if requested
-        if include_text:
-            hydrated = []
-            for item in page:
-                vk = item["verse_key"]
-                rec = by_key.get(vk)
+        if obj is not None:
+            obj = obj or {}
+            verse_keys = obj.get("verse_keys", []) or []
+            total = len(verse_keys)
+            page_keys = verse_keys[offset: offset + limit]
+            results = []
+            for vk in page_keys:
+                vk2 = norm_q(vk)
+                rec = by_key.get(vk2)
                 if not rec:
                     continue
-                obj = dict(item)
-                obj["aya_text"] = rec.get("aya_text")
-                obj["sura_name_ar"] = rec.get("sura_name_ar")
-                obj["jozz"] = rec.get("jozz")
-                obj["page"] = rec.get("page")
-                hydrated.append(obj)
-            page = hydrated
+                s, a = vk2.split(":", 1)
+                item = {"verse_key": vk2, "sura_no": int(s), "aya_no": int(a)}
+                if include_text:
+                    item["aya_text"] = rec.get("aya_text")
+                    item["sura_name_ar"] = rec.get("sura_name_ar")
+                    item["jozz"] = rec.get("jozz")
+                    item["page"] = rec.get("page")
+                results.append(item)
 
-        return {
-            "query": n,
-            "mode": "lexicon",
-            "found": True,
-            "lexicon_id": entry.get("lexicon_id"),
-            "label_ar": entry.get("label_ar", n),
-            "category": entry.get("category"),
-            "tokens_used": tokens,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "results": page
-        }
-
-    # 2) fallback: topic map
-    if isinstance(topics, dict) and n in topics:
-        # reuse /v1/topic behavior
-        obj = topics[n] or {}
-        verse_keys = obj.get("verse_keys", []) or []
-        total = len(verse_keys)
-        page_keys = verse_keys[offset: offset + limit]
-        results = []
-        for vk in page_keys:
-            vk2 = norm_q(vk)
-            rec = by_key.get(vk2)
-            if not rec:
-                continue
-            s, a = vk2.split(":", 1)
-            item = {"verse_key": vk2, "sura_no": int(s), "aya_no": int(a)}
-            if include_text:
-                item["aya_text"] = rec.get("aya_text")
-                item["sura_name_ar"] = rec.get("sura_name_ar")
-                item["jozz"] = rec.get("jozz")
-                item["page"] = rec.get("page")
-            results.append(item)
-        return {
-            "query": n,
-            "mode": "topic",
-            "found": True,
-            "topic_id": obj.get("topic_id"),
-            "description": obj.get("description"),
-            "category": obj.get("category"),
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "results": results
-        }
+            return {
+                "query": used_key or n,
+                "mode": "topic",
+                "found": True,
+                "topic_id": obj.get("topic_id"),
+                "description": obj.get("description"),
+                "category": obj.get("category"),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "results": results
+            }
 
     return {
         "query": n,
@@ -400,7 +454,6 @@ async def ayah_audio(
     if ":" not in vk:
         raise HTTPException(status_code=400, detail="Use verse_key like 2:255")
 
-    # QuranFoundation docs: recitations/{recitation_id}/by_ayah/{ayah_key}
     url = f"{QURAN_API_BASE}/recitations/{recitation_id}/by_ayah/{vk}"
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -413,17 +466,11 @@ async def ayah_audio(
         if not audio_files:
             raise HTTPException(status_code=404, detail="No audio found")
 
-        # pick first url
         u = audio_files[0].get("url")
         if not u:
             raise HTTPException(status_code=404, detail="No audio url")
 
-        # sometimes returned url may be relative
         if isinstance(u, str) and not u.startswith("http"):
             u = QURAN_VERSE_AUDIO_BASE.rstrip("/") + "/" + u.lstrip("/")
 
-        return {
-            "verse_key": vk,
-            "recitation_id": recitation_id,
-            "audio_url": u
-        }
+        return {"verse_key": vk, "recitation_id": recitation_id, "audio_url": u}
