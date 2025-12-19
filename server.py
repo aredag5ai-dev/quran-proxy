@@ -30,9 +30,8 @@ def require_api_key(x_api_key: Optional[str]):
 def match_word(text: str, token: str) -> bool:
     """
     Strict word-boundary matching suitable for Arabic text in aya_text_emlaey.
-    We avoid fuzzy matching; this is exact token matching with boundaries.
+    Exact token matching with boundaries; no fuzzy matching.
     """
-    # boundary = start OR whitespace OR common punctuation
     boundary = r"(?:^|[\s\.,;:!\?\(\)\[\]\{\}\"'«»،؛ـ\-])"
     pat = boundary + re.escape(token) + boundary
     return re.search(pat, text) is not None
@@ -127,7 +126,6 @@ def paginate(items: List[Any], offset: int, limit: int) -> List[Any]:
     return items[offset: offset + limit]
 
 def topic_lookup(name: str) -> Optional[Dict[str, Any]]:
-    """Return topic object if name matches topic_id or Arabic label_ar."""
     n = norm_q(name)
     if isinstance(topics, dict) and n in topics:
         return {"topic_id": n, "obj": topics[n]}
@@ -137,7 +135,6 @@ def topic_lookup(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 def lexicon_lookup(name: str) -> Optional[Dict[str, Any]]:
-    """Return lexicon object if name matches lexicon_id or Arabic label_ar."""
     n = norm_q(name)
     if isinstance(lexicon, dict) and n in lexicon:
         return {"lexicon_id": n, "obj": lexicon[n]}
@@ -147,16 +144,10 @@ def lexicon_lookup(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 def strict_token_search(tokens: List[str]) -> List[str]:
-    """
-    Strict OR search over aya_text_emlaey using match_word for each token.
-    Returns unique verse_keys (sorted).
-    """
     found_keys: Set[str] = set()
 
     cleaned = [norm_q(t) for t in tokens if norm_q(t)]
-    # remove stopwords from tokens
     cleaned = [t for t in cleaned if t not in stopwords]
-
     if not cleaned:
         return []
 
@@ -172,7 +163,6 @@ def strict_token_search(tokens: List[str]) -> List[str]:
                     found_keys.add(f"{s_no}:{a_no}")
                 break
 
-    # sort by sura then aya
     def keyfunc(vk: str):
         s, a = vk.split(":", 1)
         return (int(s), int(a))
@@ -180,7 +170,6 @@ def strict_token_search(tokens: List[str]) -> List[str]:
     return sorted(found_keys, key=keyfunc)
 
 def count_only_for_token(token: str) -> int:
-    """Count verses that contain this token as a strict word match."""
     tok = norm_q(token)
     if not tok:
         return 0
@@ -190,6 +179,80 @@ def count_only_for_token(token: str) -> int:
         if t and match_word(t, tok):
             c += 1
     return c
+
+def topic_response(q: str, thit: Dict[str, Any], offset: int, limit: int, include_text: bool) -> Dict[str, Any]:
+    tid = thit["topic_id"]
+    obj = thit["obj"] if isinstance(thit["obj"], dict) else {}
+    verse_keys = obj.get("verse_keys", []) or []
+    total = len(verse_keys)
+    page_keys = paginate(verse_keys, offset, limit)
+
+    results: List[Dict[str, Any]] = []
+    for vk in page_keys:
+        vk2 = norm_q(vk)
+        rec = verse_index.get(vk2)
+        if rec:
+            results.append(build_result_item(rec, include_text))
+
+    return {
+        "query": q,
+        "mode": "topic",
+        "topic_id": tid,
+        "topic": obj.get("label_ar", q),
+        "found": True,
+        "description": obj.get("definition"),
+        "category": obj.get("category"),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": results
+    }
+
+def lexicon_response(q: str, lhit: Dict[str, Any], offset: int, limit: int, include_text: bool) -> Dict[str, Any]:
+    lid = lhit["lexicon_id"]
+    obj = lhit["obj"] if isinstance(lhit["obj"], dict) else {}
+    tokens = obj.get("tokens", []) or []
+    if not isinstance(tokens, list):
+        tokens = []
+
+    cleaned_tokens = [norm_q(t) for t in tokens if norm_q(t) and norm_q(t) not in stopwords]
+    if not cleaned_tokens:
+        return {
+            "query": q,
+            "mode": "count_only",
+            "found": True,
+            "reason": "empty_or_stopwords_tokens",
+            "lexicon_id": lid,
+            "label_ar": obj.get("label_ar"),
+            "total": count_only_for_token(q),
+            "offset": offset,
+            "limit": limit,
+            "results": []
+        }
+
+    keys = strict_token_search(cleaned_tokens)
+    total = len(keys)
+    page_keys = paginate(keys, offset, limit)
+
+    results: List[Dict[str, Any]] = []
+    for vk in page_keys:
+        rec = verse_index.get(vk)
+        if rec:
+            results.append(build_result_item(rec, include_text))
+
+    return {
+        "query": q,
+        "mode": "lexicon",
+        "found": True,
+        "lexicon_id": lid,
+        "label_ar": obj.get("label_ar", q),
+        "category": obj.get("category"),
+        "tokens_used": cleaned_tokens,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "results": results
+    }
 
 # ======================
 # Endpoints
@@ -220,7 +283,6 @@ def search(
     if not qn:
         raise HTTPException(status_code=400, detail="Empty query")
 
-    # Stopwords: count-only
     if qn in stopwords:
         return {
             "query": qn,
@@ -233,7 +295,6 @@ def search(
             "results": []
         }
 
-    # In this Hybrid-A build, mode=meaning in /v1/search is still strict OR word tokens (no synonyms).
     terms: List[str] = []
     if mode == "meaning":
         terms = [t for t in qn.split(" ") if t]
@@ -257,7 +318,6 @@ def search(
                 if ok:
                     matched_term = qn
         else:
-            # meaning = OR over provided tokens (still strict word)
             for term in terms:
                 termn = norm_q(term)
                 if termn and termn not in stopwords and match_word(t, termn):
@@ -313,14 +373,13 @@ def get_topic(
 ):
     require_api_key(x_api_key)
 
-    hit = topic_lookup(name)
-    if not hit:
+    thit = topic_lookup(name)
+    if not thit:
         return {"topic": norm_q(name), "found": False, "total": 0, "offset": offset, "limit": limit, "results": []}
 
-    tid = hit["topic_id"]
-    obj = hit["obj"] if isinstance(hit["obj"], dict) else {}
+    tid = thit["topic_id"]
+    obj = thit["obj"] if isinstance(thit["obj"], dict) else {}
     verse_keys = obj.get("verse_keys", []) or []
-
     total = len(verse_keys)
     page_keys = paginate(verse_keys, offset, limit)
 
@@ -328,9 +387,8 @@ def get_topic(
     for vk in page_keys:
         vk2 = norm_q(vk)
         rec = verse_index.get(vk2)
-        if not rec:
-            continue
-        results.append(build_result_item(rec, include_text))
+        if rec:
+            results.append(build_result_item(rec, include_text))
 
     return {
         "topic": obj.get("label_ar", norm_q(name)),
@@ -347,16 +405,17 @@ def get_topic(
 @app.get("/v1/meaning")
 def meaning_hybrid_a(
     name: str = Query(..., min_length=1),
+    prefer: str = Query("lexicon", pattern="^(lexicon|topic)$"),
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=200),
     include_text: bool = Query(True),
     x_api_key: Optional[str] = Header(None)
 ):
     """
-    Hybrid-A meaning retrieval:
-    1) If topic exists in topics_core.json => return it (authoritative).
-    2) Else fallback to meaning_lexicon_core.json which defines STRICT literal tokens only.
-       Search aya_text_emlaey using strict match_word and return all matched verses (paged).
+    Hybrid-A meaning retrieval with preference control:
+    - prefer=lexicon (default): try lexicon first, then topic
+    - prefer=topic: try topic first, then lexicon
+    Both are strict (no synonyms, no interpretation).
     """
     require_api_key(x_api_key)
 
@@ -364,7 +423,6 @@ def meaning_hybrid_a(
     if not q:
         raise HTTPException(status_code=400, detail="Empty name")
 
-    # Stopwords: count-only
     if q in stopwords:
         return {
             "query": q,
@@ -377,93 +435,28 @@ def meaning_hybrid_a(
             "results": []
         }
 
-    # 1) Try curated topic first
     thit = topic_lookup(q)
-    if thit:
-        # Reuse topic output contract
-        tid = thit["topic_id"]
-        obj = thit["obj"] if isinstance(thit["obj"], dict) else {}
-        verse_keys = obj.get("verse_keys", []) or []
-        total = len(verse_keys)
-        page_keys = paginate(verse_keys, offset, limit)
-
-        results: List[Dict[str, Any]] = []
-        for vk in page_keys:
-            vk2 = norm_q(vk)
-            rec = verse_index.get(vk2)
-            if rec:
-                results.append(build_result_item(rec, include_text))
-
-        return {
-            "query": q,
-            "mode": "topic",
-            "topic_id": tid,
-            "topic": obj.get("label_ar", q),
-            "found": True,
-            "description": obj.get("definition"),
-            "category": obj.get("category"),
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "results": results
-        }
-
-    # 2) Fallback: strict lexicon tokens
     lhit = lexicon_lookup(q)
-    if not lhit:
-        return {
-            "query": q,
-            "mode": "lexicon",
-            "found": False,
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "results": []
-        }
 
-    lid = lhit["lexicon_id"]
-    obj = lhit["obj"] if isinstance(lhit["obj"], dict) else {}
-
-    tokens = obj.get("tokens", []) or []
-    if not isinstance(tokens, list):
-        tokens = []
-
-    # If all tokens are stopwords (or empty), return count-only based on the query itself
-    cleaned_tokens = [norm_q(t) for t in tokens if norm_q(t) and norm_q(t) not in stopwords]
-    if not cleaned_tokens:
-        return {
-            "query": q,
-            "mode": "count_only",
-            "found": True,
-            "reason": "empty_or_stopwords_tokens",
-            "lexicon_id": lid,
-            "label_ar": obj.get("label_ar"),
-            "total": count_only_for_token(q),
-            "offset": offset,
-            "limit": limit,
-            "results": []
-        }
-
-    keys = strict_token_search(cleaned_tokens)
-    total = len(keys)
-    page_keys = paginate(keys, offset, limit)
-
-    results: List[Dict[str, Any]] = []
-    for vk in page_keys:
-        rec = verse_index.get(vk)
-        if rec:
-            results.append(build_result_item(rec, include_text))
+    # prefer logic
+    if prefer == "topic":
+        if thit:
+            return topic_response(q, thit, offset, limit, include_text)
+        if lhit:
+            return lexicon_response(q, lhit, offset, limit, include_text)
+    else:
+        # prefer lexicon (default)
+        if lhit:
+            return lexicon_response(q, lhit, offset, limit, include_text)
+        if thit:
+            return topic_response(q, thit, offset, limit, include_text)
 
     return {
         "query": q,
         "mode": "lexicon",
-        "found": True,
-        "lexicon_id": lid,
-        "label_ar": obj.get("label_ar", q),
-        "category": obj.get("category"),
-        "tokens_used": cleaned_tokens,
-        "total": total,
+        "found": False,
+        "total": 0,
         "offset": offset,
         "limit": limit,
-        "results": results
+        "results": []
     }
