@@ -1,64 +1,36 @@
 from fastapi import FastAPI, Query, HTTPException, Header
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import json, os, re
-import httpx
+from functools import lru_cache
 
-app = FastAPI(title="Quran Proxy API (Hafs + Topics/Lexicon + Audio)")
+import numpy as np
+import httpx
+from openai import OpenAI
+
+app = FastAPI(title="Quran Proxy API (Hafs + Semantic + Audio)")
 
 # =====================
-# Settings / Env
+# Env / Settings
 # =====================
 DATA_PATH = os.environ.get("HAFS_DATA_PATH", "hafsData_v2-0.json")
-
-TOPICS_PATH = os.environ.get("TOPICS_PATH", "topics_core.json")
-LEXICON_PATH = os.environ.get("LEXICON_PATH", "lexicon_core.json")
-STOPWORDS_PATH = os.environ.get("STOPWORDS_PATH", "stopwords_ar_generic.json")
+INDEX_DIR = os.environ.get("INDEX_DIR", "index")
 
 API_KEY = os.environ.get("PROXY_API_KEY", "")
+OPENAI_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
+OPENAI_DIMS = os.environ.get("EMBED_DIMS")
+OPENAI_DIMS = int(OPENAI_DIMS) if OPENAI_DIMS else None
+
 QURAN_API_BASE = os.environ.get("QURAN_API_BASE", "https://api.quran.com/api/v4")
 QURAN_VERSE_AUDIO_BASE = os.environ.get("QURAN_VERSE_AUDIO_BASE", "https://verses.quran.foundation/")
 
 AR_NUM = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+
 
 def norm_q(s: str) -> str:
     s = (s or "").strip().translate(AR_NUM)
     s = re.sub(r"\s+", " ", s)
     return s
 
-def extract_topic_name(s: str) -> str:
-    """
-    Robust extraction so API accepts:
-    - "آيات عن الصبر" -> "الصبر"
-    - "ايات عن الصبر" -> "الصبر"
-    - "آية عن الصبر" -> "الصبر"
-    - "عن الصبر" -> "الصبر"
-    - "موضوع الصبر" -> "الصبر"
-    - "بالمعنى الصبر" -> "الصبر"
-    """
-    x = norm_q(s)
-
-    # Remove common leading phrases (Arabic)
-    # We keep it conservative: ONLY remove wrappers, not changing meaning.
-    patterns = [
-        r'^(?:آيات|ايات|آية|اية)\s+عن\s+',
-        r'^عن\s+',
-        r'^(?:موضوع|الموضوع)\s+',
-        r'^(?:بالمعنى|بمعنى)\s+',
-        r'^(?:ابحث|دور|عايز|أريد|اريد)\s+(?:عن\s+)?',
-        r'^(?:آيات|ايات)\s+(?:تتحدث\s+)?عن\s+'
-    ]
-    for p in patterns:
-        x2 = re.sub(p, "", x)
-        if x2 != x:
-            x = x2.strip()
-
-    # Remove trailing punctuation
-    x = re.sub(r'[؟\?\!\.\,\؛\:\-]+$', "", x).strip()
-
-    # If user wrote "آيات عن الصبر في القرآن" -> remove ending wrappers
-    x = re.sub(r'\s+(?:في\s+القرآن|بالقرآن|من\s+القرآن)$', "", x).strip()
-
-    return x
 
 def require_api_key(x_api_key: Optional[str]):
     if not API_KEY:
@@ -66,18 +38,32 @@ def require_api_key(x_api_key: Optional[str]):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
 def match_word(text: str, token: str) -> bool:
     pat = r'(^|[^\w])' + re.escape(token) + r'([^\w]|$)'
     return re.search(pat, text, flags=re.UNICODE) is not None
 
-def load_json_if_exists(path: str, default):
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return default
+
+def extract_topic_name(s: str) -> str:
+    x = norm_q(s)
+    patterns = [
+        r'^(?:آيات|ايات|آية|اية)\s+عن\s+',
+        r'^عن\s+',
+        r'^(?:موضوع|الموضوع)\s+',
+        r'^(?:بالمعنى|بمعنى)\s+',
+        r'^(?:ابحث|دور|عايز|أريد|اريد)\s+(?:عن\s+)?'
+    ]
+    for p in patterns:
+        x2 = re.sub(p, "", x)
+        if x2 != x:
+            x = x2.strip()
+    x = re.sub(r'[؟\?\!\.\,\؛\:\-]+$', "", x).strip()
+    x = re.sub(r'\s+(?:في\s+القرآن|بالقرآن|من\s+القرآن)$', "", x).strip()
+    return x
+
 
 # =====================
-# Load Quran data
+# Load Hafs records
 # =====================
 if not os.path.exists(DATA_PATH):
     raise RuntimeError(f"Data file not found: {DATA_PATH}")
@@ -87,7 +73,7 @@ with open(DATA_PATH, "r", encoding="utf-8") as f:
 
 records: List[Dict[str, Any]] = raw if isinstance(raw, list) else raw.get("data", [])
 if not isinstance(records, list):
-    raise RuntimeError("Unexpected JSON structure: expected a list of ayah records.")
+    raise RuntimeError("Unexpected JSON structure: expected list of records")
 
 by_key: Dict[str, Dict[str, Any]] = {}
 for r in records:
@@ -96,35 +82,95 @@ for r in records:
     if isinstance(s, int) and isinstance(a, int):
         by_key[f"{s}:{a}"] = r
 
-# =====================
-# Load topics / lexicon / stopwords
-# =====================
-topics = load_json_if_exists(TOPICS_PATH, {})
-lexicon = load_json_if_exists(LEXICON_PATH, {})
-stopwords_list = load_json_if_exists(STOPWORDS_PATH, [])
-
-stopwords = set()
-if isinstance(stopwords_list, list):
-    for w in stopwords_list:
-        if isinstance(w, str) and w.strip():
-            stopwords.add(norm_q(w))
 
 # =====================
-# Health
+# Load Semantic Index
+# =====================
+SEM_READY = False
+emb_matrix_f32: Optional[np.ndarray] = None  # float32 normalized (for fast dot)
+verse_keys: List[str] = []
+meta: Dict[str, Any] = {}
+
+try:
+    emb_path = os.path.join(INDEX_DIR, "embeddings_norm_f16.npy")
+    vk_path = os.path.join(INDEX_DIR, "verse_keys.json")
+    meta_path = os.path.join(INDEX_DIR, "meta.json")
+
+    if os.path.exists(emb_path) and os.path.exists(vk_path):
+        emb_f16 = np.load(emb_path)  # float16 normalized
+        emb_matrix_f32 = emb_f16.astype(np.float32, copy=False)  # convert once
+        with open(vk_path, "r", encoding="utf-8") as f:
+            verse_keys = json.load(f)
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        SEM_READY = True
+except Exception:
+    SEM_READY = False
+    emb_matrix_f32 = None
+    verse_keys = []
+    meta = {}
+
+
+# =====================
+# OpenAI client (for query embedding only)
+# =====================
+_openai_client = None
+
+
+def get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set on server")
+        _openai_client = OpenAI()
+    return _openai_client
+
+
+@lru_cache(maxsize=512)
+def _embed_query_cached(q: str) -> Tuple[float, ...]:
+    client = get_openai_client()
+    kwargs = {"model": OPENAI_MODEL, "input": [q]}
+    if OPENAI_DIMS:
+        kwargs["dimensions"] = OPENAI_DIMS
+    resp = client.embeddings.create(**kwargs)
+    v = np.array(resp.data[0].embedding, dtype=np.float32)
+    v = v / (np.linalg.norm(v) + 1e-12)
+    return tuple(float(x) for x in v)
+
+
+def embed_query(q: str) -> np.ndarray:
+    # numpy array from cached tuple
+    return np.array(_embed_query_cached(q), dtype=np.float32)
+
+
+def semantic_topk(q: str, k: int) -> List[Tuple[str, float]]:
+    if not SEM_READY or emb_matrix_f32 is None or not verse_keys:
+        raise HTTPException(status_code=503, detail="Semantic index is not ready on server")
+    v = embed_query(q)
+    sims = emb_matrix_f32 @ v  # cosine similarity (normalized)
+    idx = np.argsort(-sims)[:k]
+    out: List[Tuple[str, float]] = []
+    for i in idx:
+        ii = int(i)
+        out.append((verse_keys[ii], float(sims[ii])))
+    return out
+
+
+# =====================
+# Endpoints
 # =====================
 @app.get("/v1/health")
 def health():
     return {
         "ok": True,
         "records": len(records),
-        "topics": len(topics) if isinstance(topics, dict) else 0,
-        "lexicon": len(lexicon) if isinstance(lexicon, dict) else 0,
-        "stopwords": len(stopwords),
+        "semantic_ready": SEM_READY,
+        "semantic_meta": meta,
+        "semantic_count": len(verse_keys)
     }
 
-# =====================
-# Verse by key
-# =====================
+
 @app.get("/v1/verse/{verse_key}")
 def get_verse(verse_key: str, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
@@ -138,9 +184,7 @@ def get_verse(verse_key: str, x_api_key: Optional[str] = Header(None)):
     out["verse_key"] = vk
     return out
 
-# =====================
-# Literal search
-# =====================
+
 @app.get("/v1/search")
 def search(
     q: str = Query(..., min_length=1),
@@ -155,27 +199,6 @@ def search(
     qn = norm_q(q)
     if not qn:
         raise HTTPException(status_code=400, detail="Empty query")
-
-    # Stopword: count-only
-    if qn in stopwords:
-        total = 0
-        for r in records:
-            t = r.get("aya_text_emlaey") or ""
-            if not t:
-                continue
-            ok = (qn in t) if match == "phrase" else match_word(t, qn)
-            if ok:
-                total += 1
-        return {
-            "query": qn,
-            "mode": "literal",
-            "match": match,
-            "count_only": True,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "results": []
-        }
 
     results = []
     for r in records:
@@ -210,40 +233,47 @@ def search(
         "total": total,
         "offset": offset,
         "limit": limit,
+        "returned": len(page),
+        "has_more": (offset + limit) < total,
         "results": page
     }
 
-# =====================
-# Topic (curated)
-# =====================
-@app.get("/v1/topic")
-def get_topic(
-    name: str = Query(..., min_length=1),
+
+@app.get("/v1/semantic")
+@app.get("/v1/semantic/")
+def semantic(
+    q: str = Query(..., min_length=1),
     offset: int = Query(0, ge=0),
-    limit: int = Query(25, ge=1, le=200),
-    include_text: bool = Query(True),
+    limit: int = Query(10, ge=1, le=200),
+    include_text: bool = Query(False),
     x_api_key: Optional[str] = Header(None)
 ):
     require_api_key(x_api_key)
-    n_raw = norm_q(name)
-    n = extract_topic_name(n_raw)
 
-    if not isinstance(topics, dict) or n not in topics:
-        return {"topic": n, "found": False, "total": 0, "offset": offset, "limit": limit, "results": []}
+    qn = extract_topic_name(q)
+    if not qn:
+        raise HTTPException(status_code=400, detail="Empty query")
 
-    obj = topics[n] or {}
-    verse_keys = obj.get("verse_keys", []) or []
-    total = len(verse_keys)
-    page_keys = verse_keys[offset: offset + limit]
+    # Total corpus size (stable), not "k"
+    total = len(verse_keys) if verse_keys else 0
+
+    # We only compute top (offset+limit) to avoid unnecessary work
+    k = min(200, offset + limit)
+    pairs = semantic_topk(qn, k)
+    page_pairs = pairs[offset: offset + limit]
 
     results = []
-    for vk in page_keys:
-        vk2 = norm_q(vk)
-        rec = by_key.get(vk2)
+    for vk, score in page_pairs:
+        rec = by_key.get(vk)
         if not rec:
             continue
-        s, a = vk2.split(":", 1)
-        item = {"verse_key": vk2, "sura_no": int(s), "aya_no": int(a)}
+        s, a = vk.split(":", 1)
+        item = {
+            "verse_key": vk,
+            "sura_no": int(s),
+            "aya_no": int(a),
+            "score": score
+        }
         if include_text:
             item["aya_text"] = rec.get("aya_text")
             item["sura_name_ar"] = rec.get("sura_name_ar")
@@ -251,197 +281,35 @@ def get_topic(
             item["page"] = rec.get("page")
         results.append(item)
 
+    returned = len(results)
+    has_more = (offset + limit) < min(200, total)  # due to k cap at 200
     return {
-        "topic": n,
-        "topic_id": obj.get("topic_id"),
-        "found": True,
-        "description": obj.get("description"),
-        "category": obj.get("category"),
+        "query": qn,
+        "mode": "semantic",
         "total": total,
         "offset": offset,
         "limit": limit,
+        "returned": returned,
+        "has_more": has_more,
         "results": results
     }
 
-# =====================
-# Meaning (lexicon-first hybrid A)
-# =====================
-@app.get("/v1/meaning")
-def meaning(
-    name: str = Query(..., min_length=1),
-    prefer: str = Query("lexicon", pattern="^(lexicon|topic)$"),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(25, ge=1, le=200),
-    include_text: bool = Query(True),
-    x_api_key: Optional[str] = Header(None)
-):
-    require_api_key(x_api_key)
 
-    n_raw = norm_q(name)
-    n = extract_topic_name(n_raw)
-
-    # Try exact, then remove leading "ال" once
-    candidates = [n]
-    if n.startswith("ال") and len(n) > 2:
-        candidates.append(n[2:])
-    # also try adding "ال" if user wrote without it
-    if not n.startswith("ال"):
-        candidates.append("ال" + n)
-
-    # 1) lexicon preferred
-    if prefer == "lexicon" and isinstance(lexicon, dict):
-        entry = None
-        used_key = None
-        for c in candidates:
-            if c in lexicon:
-                entry = lexicon[c]
-                used_key = c
-                break
-
-        if entry is not None:
-            entry = entry or {}
-            tokens = entry.get("tokens", []) or []
-            tokens = [norm_q(t) for t in tokens if isinstance(t, str) and t.strip()]
-
-            # if tokens too common -> count_only guard
-            if any(t in stopwords for t in tokens):
-                return {
-                    "query": used_key or n,
-                    "mode": "lexicon",
-                    "found": True,
-                    "lexicon_id": entry.get("lexicon_id"),
-                    "label_ar": entry.get("label_ar", used_key or n),
-                    "category": entry.get("category"),
-                    "tokens_used": tokens,
-                    "count_only": True,
-                    "total": 0,
-                    "offset": offset,
-                    "limit": limit,
-                    "results": []
-                }
-
-            hits = []
-            for r in records:
-                t = r.get("aya_text_emlaey") or ""
-                if not t:
-                    continue
-                ok = False
-                for tok in tokens:
-                    if tok and match_word(t, tok):
-                        ok = True
-                        break
-                if ok:
-                    s = r.get("sura_no")
-                    a = r.get("aya_no")
-                    hits.append({"verse_key": f"{s}:{a}", "sura_no": s, "aya_no": a})
-
-            total = len(hits)
-            page = hits[offset: offset + limit]
-
-            if include_text:
-                hydrated = []
-                for item in page:
-                    vk = item["verse_key"]
-                    rec = by_key.get(vk)
-                    if not rec:
-                        continue
-                    obj = dict(item)
-                    obj["aya_text"] = rec.get("aya_text")
-                    obj["sura_name_ar"] = rec.get("sura_name_ar")
-                    obj["jozz"] = rec.get("jozz")
-                    obj["page"] = rec.get("page")
-                    hydrated.append(obj)
-                page = hydrated
-
-            return {
-                "query": used_key or n,
-                "mode": "lexicon",
-                "found": True,
-                "lexicon_id": entry.get("lexicon_id"),
-                "label_ar": entry.get("label_ar", used_key or n),
-                "category": entry.get("category"),
-                "tokens_used": tokens,
-                "total": total,
-                "offset": offset,
-                "limit": limit,
-                "results": page
-            }
-
-    # 2) topic fallback
-    if isinstance(topics, dict):
-        obj = None
-        used_key = None
-        for c in candidates:
-            if c in topics:
-                obj = topics[c]
-                used_key = c
-                break
-
-        if obj is not None:
-            obj = obj or {}
-            verse_keys = obj.get("verse_keys", []) or []
-            total = len(verse_keys)
-            page_keys = verse_keys[offset: offset + limit]
-            results = []
-            for vk in page_keys:
-                vk2 = norm_q(vk)
-                rec = by_key.get(vk2)
-                if not rec:
-                    continue
-                s, a = vk2.split(":", 1)
-                item = {"verse_key": vk2, "sura_no": int(s), "aya_no": int(a)}
-                if include_text:
-                    item["aya_text"] = rec.get("aya_text")
-                    item["sura_name_ar"] = rec.get("sura_name_ar")
-                    item["jozz"] = rec.get("jozz")
-                    item["page"] = rec.get("page")
-                results.append(item)
-
-            return {
-                "query": used_key or n,
-                "mode": "topic",
-                "found": True,
-                "topic_id": obj.get("topic_id"),
-                "description": obj.get("description"),
-                "category": obj.get("category"),
-                "total": total,
-                "offset": offset,
-                "limit": limit,
-                "results": results
-            }
-
-    return {
-        "query": n,
-        "mode": "lexicon" if prefer == "lexicon" else "topic",
-        "found": False,
-        "total": 0,
-        "offset": offset,
-        "limit": limit,
-        "results": []
-    }
-
-# =====================
-# Audio: list recitations
-# =====================
 @app.get("/v1/recitations")
 async def recitations(
     language: str = Query("ar", min_length=2, max_length=5),
     x_api_key: Optional[str] = Header(None)
 ):
     require_api_key(x_api_key)
-
     url = f"{QURAN_API_BASE}/resources/recitations"
     params = {"language": language}
-
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, params=params)
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Upstream error: {r.status_code}")
         return r.json()
 
-# =====================
-# Audio: ayah recitation url
-# =====================
+
 @app.get("/v1/audio/ayah")
 async def ayah_audio(
     verse_key: str = Query(..., min_length=3),
@@ -449,13 +317,11 @@ async def ayah_audio(
     x_api_key: Optional[str] = Header(None)
 ):
     require_api_key(x_api_key)
-
     vk = norm_q(verse_key)
     if ":" not in vk:
         raise HTTPException(status_code=400, detail="Use verse_key like 2:255")
 
     url = f"{QURAN_API_BASE}/recitations/{recitation_id}/by_ayah/{vk}"
-
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url)
         if r.status_code != 200:
